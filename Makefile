@@ -9,11 +9,6 @@ CC = gcc
 # -D_GNU_SOURCE: Enables certain modern features for shared memory/signals
 CFLAGS = -Wall -Wextra -g -O2 -D_GNU_SOURCE
 
-# --- Libraries (Requirement-Specific) ---
-# -lrt: Required for POSIX Shared Memory (shm_open, shm_unlink) [cite: 44, 58]
-# -lpthread: Required for POSIX Semaphores (sem_open, sem_wait) [cite: 49, 51]
-LIBS = -lrt -lpthread
-
 # --- File Structure ---
 # List all .c files here. Based on your project needs:
 # main: Master process loop and socket setup [cite: 32]
