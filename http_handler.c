@@ -23,14 +23,15 @@ void handle_client(int client_fd, server_metrics_t* stats, sem_t* sem) {
     if (strcmp(path, "/status") == 0) {
         char response[1024]; // Increased size for safety
         sem_wait(sem);
-        // Use %llu for uint64_t metrics
-        int len = snprintf(response, sizeof(response), 
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n"
-                    "<h1>Server Status</h1>"
-                    "<p>Total Requests: %llu</p>"
-                    "<p>200 OK: %llu</p>"
-                    "<p>404 Not Found: %llu</p>",
-                    stats->total_requests, stats->success_200, stats->error_404);
+        // Inside handle_client() for the "/status" path:
+int len = snprintf(response, sizeof(response), 
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n"
+            "<h1>Server Status</h1>"
+            "<p>Total Requests: %llu</p>"
+            "<p>200 OK: %llu</p>"
+            "<p>404 Not Found: %llu</p>"
+            "<p>Total Bytes Sent: %llu</p>", // Add this line
+            stats->total_requests, stats->success_200, stats->error_404, stats->total_bytes_sent); // Add stats->total_bytes_sent
         sem_post(sem);
         write(client_fd, response, len);
     } else {
@@ -44,15 +45,20 @@ void handle_client(int client_fd, server_metrics_t* stats, sem_t* sem) {
             fstat(fd, &st);
             write(client_fd, "HTTP/1.1 200 OK\r\n\r\n", 19);
             
+            // Inside handle_client() when serving a local file:
             char file_buf[1024];
             ssize_t n;
+            size_t bytes_sent_for_file = 19; // Start with the 19 bytes of the "HTTP/1.1 200 OK\r\n\r\n" header
+
             while ((n = read(fd, file_buf, sizeof(file_buf))) > 0) {
                 write(client_fd, file_buf, n);
+                bytes_sent_for_file += n; // Accumulate bytes
             }
             close(fd);
 
             sem_wait(sem);
             stats->success_200++;
+            stats->total_bytes_sent += bytes_sent_for_file; // Update the shared memory counter safely
             sem_post(sem);
         } else {
             // 404 Not Found [cite: 74]
