@@ -1,98 +1,90 @@
-/**
- * @file http_handler.c
- * @brief HTTP request parser, file server, and metric dashboard generator.
- *
- * This module runs entirely within the child processes. It handles incoming
- * network streams, parses HTTP methods, serves local files, and dynamically
- * generates the live "/status" dashboard. It uses POSIX semaphores to safely
- * update global tracking metrics without race conditions.
- */
-
-#include "http_handler.h"
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/sendfile.h>
+#include <netinet/tcp.h>
+#include <errno.h>
 
-void handle_client(int client_fd, server_metrics_t* stats, sem_t* sem) {
-    char buffer[1024];
-    
-    // Read the incoming data stream from the client.
-    ssize_t bytes_read = read(client_fd, buffer, sizeof(buffer) - 1);
-    if (bytes_read <= 0) return;
-    buffer[bytes_read] = '\0';
+/**
+ * Serves a static file to the client socket using zero-copy sendfile(2)
+ *
+ * @param client_socket Connected client file descriptor
+ * @param file_path     Path to the requested static file
+ * @param content_type  MIME type (e.g., "text/html", "image/png")
+ * @return 0 on success, -1 on failure
+ */
+int serve_file_zero_copy(int client_socket, const char *file_path, const char *content_type) {
+    // Open the requested file in read-only mode
+    int file_fd = open(file_path, O_RDONLY);
+    if (file_fd < 0) {
+        perror("open failed");
+        return -1;
+    }
 
-    char method[10], path[256];
-    
-    // Parse the HTTP GET request to determine the requested file path.
-    sscanf(buffer, "%s %s", method, path);
+    // Fetch metadata to determine exact byte length for Content-Length
+    struct stat st;
+    if (fstat(file_fd, &st) < 0) {
+        perror("fstat failed");
+        close(file_fd);
+        return -1;
+    }
 
-    // Acquire lock before updating shared memory counters to prevent data corruption.
-    sem_wait(sem);
-    stats->total_requests++;
-    // Safely increment memory counters then release the semaphore for waiting processes.
-    sem_post(sem);
+    off_t total_bytes = st.st_size;
 
-    /* Built-in Live Dashboard Endpoint */
-    // If the client asks for "/status", bypass the file system entirely.
-    if (strcmp(path, "/status") == 0) {
-        char response[1024];
-        
-        // Securely read the current values from the shared memory block.
-        sem_wait(sem);
-        // Dynamically generate an HTML page displaying live traffic and health stats.
-        int len = snprintf(response, sizeof(response), 
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n"
-                    "<h1>Server Status</h1>"
-                    "<p>Total Requests: %llu</p>"
-                    "<p>200 OK: %llu</p>"
-                    "<p>404 Not Found: %llu</p>",
-                    stats->total_requests, stats->success_200, stats->error_404);
-        sem_post(sem);
-        
-        write(client_fd, response, len);
-    } else {
-        /* Standard Static File Serving */
-        // Attempt to locate the requested file on the server's local file system.
-        char *file_path = path + 1; // Remove leading '/'
-        int fd = open(file_path, O_RDONLY);
-        
-        if (fd != -1) {
-            struct stat st;
-            fstat(fd, &st);
-            
-            // If the file exists, generate a standard HTTP 200 OK response header.
-            write(client_fd, "HTTP/1.1 200 OK\r\n\r\n", 19);
-            
-            char file_buf[1024];
-            ssize_t n;
-            // Send the file's contents over the network.
-            while ((n = read(fd, file_buf, sizeof(file_buf))) > 0) {
-                write(client_fd, file_buf, n);
+    // Format and send HTTP headers
+    char header_buffer[512];
+    int header_len = snprintf(header_buffer, sizeof(header_buffer),
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: %s\r\n"
+        "Content-Length: %ld\r\n"
+        "Connection: close\r\n"
+        "Server: C-ZeroCopy-Server/1.0\r\n"
+        "\r\n",
+        content_type, (long)total_bytes);
+
+    if (send(client_socket, header_buffer, header_len, 0) < 0) {
+        perror("send header failed");
+        close(file_fd);
+        return -1;
+    }
+
+    // Enable TCP_CORK to coalesce packets
+    int cork = 1;
+    setsockopt(client_socket, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
+
+    // Stream data directly in kernel space via sendfile loop
+    off_t offset = 0;
+    while (offset < total_bytes) {
+        // sendfile(out_fd, in_fd, offset_ptr, count)
+        // offset is updated automatically by the kernel
+        ssize_t bytes_sent = sendfile(client_socket, file_fd, &offset, total_bytes - offset);
+
+        if (bytes_sent < 0) {
+            if (errno == EAGAIN || errno == EINTR) {
+                // Interrupted or socket buffer temporarily full
+                continue;
             }
-            close(fd);
+            perror("sendfile failed");
+            close(file_fd);
+            return -1;
+        }
 
-            // Update success tracking metrics using the semaphore lock.
-            sem_wait(sem);
-            stats->success_200++;
-            sem_post(sem);
-        } else {
-            // If the file is missing, respond with an HTTP 404 Not Found error.
-            const char *not_found = "HTTP/1.1 404 Not Found\r\n\r\nFile Not Found";
-            write(client_fd, not_found, strlen(not_found));
-            
-            // Update error tracking metrics securely.
-            sem_wait(sem);
-            stats->error_404++;
-            sem_post(sem);
+        if (bytes_sent == 0) {
+            // EOF reached unexpectedly
+            break;
         }
     }
-    
-    // Once the response is completely sent, close the connection.
-    close(client_fd);
-    
-    // Terminate the child process.
-    exit(0); 
+
+    // Uncork socket to flush remaining data
+    cork = 0;
+    setsockopt(client_socket, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
+
+    close(file_fd);
+    return 0;
 }
