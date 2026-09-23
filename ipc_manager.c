@@ -14,15 +14,27 @@
 #include <stdio.h>
 
 server_metrics_t* init_shared_memory() {
-    // Initialize a shared memory segment using standard system calls[cite: 541].
     int shm_fd = shm_open(SHM_NAME, O_CREAT | O_RDWR, 0666);
-    ftruncate(shm_fd, sizeof(server_metrics_t));
+    if (shm_fd < 0) {
+        perror("shm_open");
+        return NULL;
+    }
+
+    if (ftruncate(shm_fd, sizeof(server_metrics_t)) == -1) {
+        perror("ftruncate");
+        close(shm_fd);
+        return NULL;
+    }
     
-    // Map the shared memory block into the process address space.
     server_metrics_t* stats = (server_metrics_t*)mmap(NULL, sizeof(server_metrics_t), 
                               PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    close(shm_fd);
+
+    if (stats == MAP_FAILED) {
+        perror("mmap");
+        return NULL;
+    }
     
-    // Initialize the specific data structure containing various live counters[cite: 542].
     stats->total_requests = 0;
     stats->success_200 = 0;
     stats->error_404 = 0;

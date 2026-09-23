@@ -1,31 +1,30 @@
 TARGET = webserver
 
-# Default compiler (Clang on macOS, GCC on Linux)
+# Default compiler
 CC ?= gcc
 
-# Base warning and debug flags
-# -fno-omit-frame-pointer ensures accurate stack traces for Flame Graphs
-CFLAGS = -Wall -Wextra -g -O2 -fno-omit-frame-pointer -D_GNU_SOURCE
+# Base warning, optimization, and debugging flags
+# -fno-omit-frame-pointer ensures accurate stack traces for perf/Flame Graphs
+CFLAGS = -Wall -Wextra -O2 -g -fno-omit-frame-pointer
 
-# Platform detection for OS-specific libraries/flags
+# Platform detection
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Linux)
-    # Linux requires -lrt and -pthread for POSIX shared memory and semaphores
-    LIBS = -lrt -pthread
+    # io_uring requires -luring; POSIX shm/sem require -lrt and -pthread
+    LIBS = -luring -lrt -pthread
 else ifeq ($(UNAME_S),Darwin)
-    # macOS built-in libraries handle shm/sem natively
-    LIBS = -pthread
+    $(error io_uring is a Linux-only subsystem. Please build and run inside Docker/Linux VM)
 endif
 
 # --- File Structure ---
 SRCS = main.c http_handler.c ipc_manager.c signal_handlers.c
 OBJS = $(SRCS:.c=.o)
-HEADERS = server_stats.h http_handler.h ipc_manager.h signal_handlers.h
+HEADERS = uring_server.h server_stats.h http_handler.h ipc_manager.h signal_handlers.h
 
 # --- Build Rules ---
 all: $(TARGET)
 
-# Linking the final executable
+# Linking the final executable (ensure $(LIBS) comes AFTER $(OBJS))
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $(TARGET) $(OBJS) $(LIBS)
 	@echo "Build successful: ./$(TARGET)"
@@ -40,7 +39,7 @@ clean:
 	@echo "Cleaned build artifacts and profiling logs."
 
 distclean: clean
-	@echo "Note: Check /dev/shm (Linux) or ipcs (macOS) for leaked shared memory segments."
+	@echo "Note: Check /dev/shm for leaked shared memory segments."
 
 run: $(TARGET)
 	./$(TARGET) 8080

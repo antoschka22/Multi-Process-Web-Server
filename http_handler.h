@@ -18,4 +18,15 @@ void serve_status_page(int client_socket, server_metrics_t *stats);
  */
 void serve_file(int client_socket, const char *path);
 
+/**
+ * @brief Parses an HTTP GET request and prepares the HTTP response.
+ *
+ * @param request_buf Raw incoming request buffer from io_uring.
+ * @param req_len Number of bytes received.
+ * @param response_buf Output buffer to write the HTTP response into.
+ * @param max_resp_len Maximum capacity of the output buffer.
+ * @return int Total bytes written to response_buf, or -1 on error.
+ */
+int handle_http_request(const char *request_buf, size_t req_len, char *response_buf, size_t max_resp_len);
+
 #endif

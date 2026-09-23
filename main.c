@@ -1,12 +1,11 @@
 /**
- * @brief Master process loop implementing a Pre-Fork Worker Pool architecture.
+ * @brief   ster process loop implementing a Pre-Fork Worker Pool architecture.
  *
  * This module sets up the TCP listening socket, initializes Inter-Process
  * Communication (IPC) resources, and manages a persistent pool of child worker
  * processes that concurrently accept connections on the shared server socket.
  * It also provides fault tolerance via process supervision and automated child respawning.
  */
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,34 +16,22 @@
 #include <signal.h>
 #include <errno.h>
 #include <sys/wait.h>
+#include <fcntl.h>
+#include <liburing.h>
 
+#include "uring_server.h"
 #include "http_handler.h"
-#include "ipc_manager.h"
 #include "signal_handlers.h"
 #include "server_stats.h"
 
 #define DEFAULT_PORT 8080
-#define BACKLOG 128
+#define BACKLOG 512
 #define NUM_WORKERS 4
 
-/**
- * @brief Tracking array for active worker process IDs.
- */
 static pid_t worker_pids[NUM_WORKERS];
-
-/**
- * @brief Volatile flag indicating the operational state of the master process.
- *        Marked sig_atomic_t to ensure safe reads/writes across signal boundaries.
- */
 static volatile sig_atomic_t server_running = 1;
 
-/**
- * @brief Signal handler to initiate a graceful shutdown sequence.
- * 
- * Propagates SIGTERM to all registered worker processes before the master exits.
- *
- * @param sig Signal number received (SIGINT or SIGTERM).
- */
+/* Signal handler for graceful master shutdown */
 static void handle_master_sigint(int sig) {
     (void)sig;
     server_running = 0;
@@ -55,152 +42,239 @@ static void handle_master_sigint(int sig) {
     }
 }
 
-int main(int argc, char *argv[]) {
-    int port = (argc > 1) ? atoi(argv[1]) : DEFAULT_PORT;
-    int server_fd;
-    struct sockaddr_in address;
-    int opt = 1;
+/* Worker signal handler to break the io_uring loop */
+static void handle_worker_sigterm(int sig) {
+    (void)sig;
+    server_running = 0;
+}
 
-    /* 1. IPC Resource Initialization */
-    server_metrics_t *stats = init_shared_memory();
-    sem_t *sem = init_semaphore();
+/* Helper: submit async accept to the ring */
+static void add_accept(struct io_uring *ring, int server_sock, struct sockaddr_in *client_addr, socklen_t *client_len) {
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    io_uring_prep_accept(sqe, server_sock, (struct sockaddr *)client_addr, client_len, 0);
+    
+    conn_context_t *ctx = malloc(sizeof(conn_context_t));
+    ctx->fd = server_sock;
+    ctx->event_type = EVENT_ACCEPT;
+    
+    io_uring_sqe_set_data(sqe, ctx);
+}
 
-    if (!stats || !sem) {
-        perror("Failed to initialize IPC");
+/* Helper: submit async read to the ring */
+static void add_read(struct io_uring *ring, int client_fd) {
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    
+    conn_context_t *ctx = malloc(sizeof(conn_context_t));
+    ctx->fd = client_fd;
+    ctx->event_type = EVENT_READ;
+    ctx->bytes_transferred = 0;
+    
+    io_uring_prep_read(sqe, client_fd, ctx->buffer, BUFFER_SIZE - 1, 0);
+    io_uring_sqe_set_data(sqe, ctx);
+}
+
+/* Helper: submit async write to the ring */
+static void add_write(struct io_uring *ring, conn_context_t *ctx) {
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    
+    ctx->event_type = EVENT_WRITE;
+    io_uring_prep_write(sqe, ctx->fd, ctx->buffer, ctx->total_to_write, 0);
+    io_uring_sqe_set_data(sqe, ctx);
+}
+
+/**
+ * @brief Worker event loop powered by io_uring
+ */
+static void run_worker_loop(int server_sock, int worker_id) {
+    struct io_uring ring;
+    struct sockaddr_in client_addr;
+    socklen_t client_len = sizeof(client_addr);
+
+    // Setup worker-specific signal handler
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = handle_worker_sigterm;
+    sigaction(SIGTERM, &sa, NULL);
+
+    // 1. Initialize io_uring for this worker
+    if (io_uring_queue_init(QUEUE_DEPTH, &ring, 0) < 0) {
+        perror("io_uring_queue_init");
         exit(EXIT_FAILURE);
     }
 
-    /* 2. TCP Socket Initialization and Configuration */
-    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
-        perror("Socket failed");
-        exit(EXIT_FAILURE);
-    }
+    printf("[Worker %d (PID %d)] io_uring ring initialized\n", worker_id, getpid());
 
-    /* Allow rapid reuse of local addresses in TIME_WAIT status */
-    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
-        perror("setsockopt SO_REUSEADDR");
-        exit(EXIT_FAILURE);
-    }
+    // 2. Queue first accept operation
+    add_accept(&ring, server_sock, &client_addr, &client_len);
+    io_uring_submit(&ring);
 
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(port);
+    // 3. Worker Event Loop
+    while (server_running) {
+        struct io_uring_cqe *cqe;
+        
+        int ret = io_uring_wait_cqe(&ring, &cqe);
+        if (ret < 0) {
+            if (ret == -EINTR) continue; // Interrupted by shutdown signal
+            perror("io_uring_wait_cqe");
+            break;
+        }
 
-    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
-        perror("Bind failed");
-        exit(EXIT_FAILURE);
-    }
+        conn_context_t *ctx = (conn_context_t *)io_uring_cqe_get_data(cqe);
+        int res = cqe->res;
 
-    if (listen(server_fd, BACKLOG) < 0) {
-        perror("Listen failed");
-        exit(EXIT_FAILURE);
-    }
+        if (res < 0) {
+            // An I/O error occurred on this entry
+            if (ctx->event_type != EVENT_ACCEPT) {
+                close(ctx->fd);
+                free(ctx);
+            }
+            io_uring_cqe_seen(&ring, cqe);
+            continue;
+        }
 
-    printf("====================================================\n");
-    printf(" Master process started [PID: %d]\n", getpid());
-    printf(" Listening on port: %d (Pool size: %d workers)\n", port, NUM_WORKERS);
-    printf("====================================================\n");
-
-    /* 3. Pre-Fork Worker Pool Creation */
-    for (int i = 0; i < NUM_WORKERS; i++) {
-        pid_t pid = fork();
-
-        if (pid < 0) {
-            perror("Fork failed during pool creation");
-            exit(EXIT_FAILURE);
-        } else if (pid == 0) {
-            /* ---------------------------------------------------- */
-            /*                 CHILD / WORKER LOOP                  */
-            /* ---------------------------------------------------- */
-            struct sockaddr_in client_addr;
-            socklen_t client_len = sizeof(client_addr);
-
-            while (1) {
-                /*
-                 * Multiple workers block concurrently on accept().
-                 * Modern Linux kernels wake a single worker (mitigating the thundering herd problem).
-                 */
-                int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
+        switch (ctx->event_type) {
+            case EVENT_ACCEPT: {
+                int client_fd = res;
                 
-                if (client_fd < 0) {
-                    /* Retry on non-fatal signal interruptions */
-                    if (errno == EINTR) {
-                        continue;
-                    }
-                    perror("Worker accept error");
-                    break;
-                }
+                // Read from the newly connected socket
+                add_read(&ring, client_fd);
 
-                /* Process client request using shared memory metrics protected by semaphore */
-                handle_client(client_fd, stats, sem);
-
-                close(client_fd);
+                // Re-queue the accept listener to keep accepting new connections
+                add_accept(&ring, server_sock, &client_addr, &client_len);
+                free(ctx);
+                break;
             }
 
-            close(server_fd);
-            exit(0);
-        } else {
-            /* Master process: record child PID */
-            worker_pids[i] = pid;
-            printf(" [Master] Spawned persistent worker [%d] PID: %d\n", i + 1, pid);
+            case EVENT_READ: {
+                if (res == 0) {
+                    // Client disconnected (EOF)
+                    close(ctx->fd);
+                    free(ctx);
+                } else {
+                    ctx->buffer[res] = '\0';
+
+                    // Delegate HTTP parsing and response assembly to http_handler
+                    // Expecting handle_http_request to populate ctx->buffer or return bytes written
+                    int written = handle_http_request(ctx->buffer, res, ctx->buffer, BUFFER_SIZE);
+                    
+                    if (written > 0) {
+                        ctx->total_to_write = written;
+                        add_write(&ring, ctx);
+                    } else {
+                        close(ctx->fd);
+                        free(ctx);
+                    }
+                }
+                break;
+            }
+
+            case EVENT_WRITE: {
+                // Response delivered; close connection and free context
+                close(ctx->fd);
+                free(ctx);
+                break;
+            }
         }
+
+        io_uring_cqe_seen(&ring, cqe);
+        io_uring_submit(&ring);
     }
 
-    /* 4. Configure Termination Signal Actions for Master */
+    io_uring_queue_exit(&ring);
+    close(server_sock);
+    exit(EXIT_SUCCESS);
+}
+
+int main(int argc, char *argv[]) {
+    int port = DEFAULT_PORT;
+    if (argc > 1) {
+        port = atoi(argv[1]);
+    }
+
+    // 1. Setup Listening Socket with SO_REUSEPORT (Kernel level round-robin across workers)
+    int server_sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_sock < 0) {
+        perror("socket");
+        exit(EXIT_FAILURE);
+    }
+
+    int opt = 1;
+    setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    setsockopt(server_sock, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+
+    struct sockaddr_in server_addr;
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = INADDR_ANY;
+    server_addr.sin_port = htons(port);
+
+    if (bind(server_sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        perror("bind");
+        close(server_sock);
+        exit(EXIT_FAILURE);
+    }
+
+    if (listen(server_sock, BACKLOG) < 0) {
+        perror("listen");
+        close(server_sock);
+        exit(EXIT_FAILURE);
+    }
+
+    printf("[Master PID %d] Listening on port %d with %d pre-forked workers\n", 
+           getpid(), port, NUM_WORKERS);
+
+    // 2. Register Master Signal Handlers
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = handle_master_sigint;
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
-    /* 5. Master Supervision Loop: Monitor and supervise child workers */
-    while (server_running) {
-        int status;
-        pid_t dead_child = wait(&status);
-
-        if (dead_child < 0) {
-            if (errno == EINTR) {
-                /* Interrupted by signal handler (e.g., SIGINT/SIGTERM); evaluate server_running */
-                continue;
-            }
-            break;
-        }
-
-        /* Auto-respawn: replace unexpected worker terminations during runtime */
-        if (server_running) {
-            printf(" [Master] Worker PID %d exited. Respawning replacement...\n", dead_child);
-            for (int i = 0; i < NUM_WORKERS; i++) {
-                if (worker_pids[i] == dead_child) {
-                    pid_t new_pid = fork();
-                    if (new_pid == 0) {
-                        /* Replacement worker event loop */
-                        struct sockaddr_in client_addr;
-                        socklen_t client_len = sizeof(client_addr);
-                        while (1) {
-                            int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
-                            if (client_fd < 0) {
-                                if (errno == EINTR) continue;
-                                break;
-                            }
-                            handle_client(client_fd, stats, sem);
-                            close(client_fd);
-                        }
-                        close(server_fd);
-                        exit(0);
-                    } else if (new_pid > 0) {
-                        worker_pids[i] = new_pid;
-                        printf(" [Master] Replacement worker PID: %d created.\n", new_pid);
-                    }
-                    break;
-                }
-            }
+    // 3. Fork Worker Processes
+    for (int i = 0; i < NUM_WORKERS; i++) {
+        pid_t pid = fork();
+        if (pid < 0) {
+            perror("fork");
+            exit(EXIT_FAILURE);
+        } else if (pid == 0) {
+            // Child Worker: Enters io_uring event loop
+            run_worker_loop(server_sock, i);
+        } else {
+            // Master: Track child PID
+            worker_pids[i] = pid;
         }
     }
 
-    /* 6. Teardown and Resource Deallocation */
-    printf("\n[Master] Terminating server and cleaning up IPC resources...\n");
-    close(server_fd);
-    cleanup_ipc();
+    // 4. Master Process Supervisor Loop
+    while (server_running) {
+        int status;
+        pid_t dead_worker = waitpid(-1, &status, WNOHANG);
 
+        if (dead_worker > 0) {
+            for (int i = 0; i < NUM_WORKERS; i++) {
+                if (worker_pids[i] == dead_worker) {
+                    printf("[Master] Worker %d (PID %d) died. Respawning...\n", i, dead_worker);
+                    pid_t new_pid = fork();
+                    if (new_pid == 0) {
+                        run_worker_loop(server_sock, i);
+                    } else {
+                        worker_pids[i] = new_pid;
+                    }
+                }
+            }
+        }
+        sleep(1);
+    }
+
+    // 5. Cleanup and Graceful Exit
+    printf("\n[Master] Terminating workers and cleaning up...\n");
+    for (int i = 0; i < NUM_WORKERS; i++) {
+        if (worker_pids[i] > 0) {
+            waitpid(worker_pids[i], NULL, 0);
+        }
+    }
+
+    close(server_sock);
+    printf("[Master] Server shut down cleanly.\n");
     return 0;
 }
