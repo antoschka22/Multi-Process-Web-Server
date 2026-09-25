@@ -95,20 +95,26 @@ static void run_worker_loop(int server_sock, int worker_id) {
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = handle_worker_sigterm;
     sigaction(SIGTERM, &sa, NULL);
+    int written = handle_http_request(ctx->buffer, res, ctx->buffer, BUFFER_SIZE, stats);
 
-    // 1. Initialize io_uring for this worker
-    if (io_uring_queue_init(QUEUE_DEPTH, &ring, 0) < 0) {
-        perror("io_uring_queue_init");
+    // Initialize io_uring with Kernel Submission Polling (SQPOLL)
+    struct io_uring_params params;
+    memset(&params, 0, sizeof(params));
+    params.flags = IORING_SETUP_SQPOLL;
+    params.sq_thread_idle = 2000; // Milliseconds before kernel thread sleeps if idle
+
+    if (io_uring_queue_init_params(QUEUE_DEPTH, &ring, &params) < 0) {
+        perror("io_uring_queue_init_params (SQPOLL)");
         exit(EXIT_FAILURE);
     }
 
-    printf("[Worker %d (PID %d)] io_uring ring initialized\n", worker_id, getpid());
+    printf("[Worker %d (PID %d)] io_uring SQPOLL ring initialized\n", worker_id, getpid());
 
-    // 2. Queue first accept operation
+    // Queue first accept operation
     add_accept(&ring, server_sock, &client_addr, &client_len);
     io_uring_submit(&ring);
 
-    // 3. Worker Event Loop
+    // Worker Event Loop
     while (server_running) {
         struct io_uring_cqe *cqe;
         
@@ -191,7 +197,7 @@ int main(int argc, char *argv[]) {
         port = atoi(argv[1]);
     }
 
-    // 1. Setup Listening Socket with SO_REUSEPORT (Kernel level round-robin across workers)
+    // Setup Listening Socket with SO_REUSEPORT (Kernel level round-robin across workers)
     int server_sock = socket(AF_INET, SOCK_STREAM, 0);
     if (server_sock < 0) {
         perror("socket");
@@ -222,6 +228,23 @@ int main(int argc, char *argv[]) {
 
     printf("[Master PID %d] Listening on port %d with %d pre-forked workers\n", 
            getpid(), port, NUM_WORKERS);
+
+    // Initialize POSIX Shared Memory
+    server_metrics_t *stats = init_shared_memory();
+    if (!stats) {
+        fprintf(stderr, "Failed to initialize shared memory\n");
+        exit(EXIT_FAILURE);
+    }
+
+    // Register signals and fork workers
+    for (int i = 0; i < NUM_WORKERS; i++) {
+        pid_t pid = fork();
+        if (pid == 0) {
+            run_worker_loop(server_sock, i, stats);
+        } else {
+            worker_pids[i] = pid;
+        }
+    }
 
     // 2. Register Master Signal Handlers
     struct sigaction sa;
@@ -274,7 +297,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    cleanup_ipc();
     close(server_sock);
-    printf("[Master] Server shut down cleanly.\n");
     return 0;
 }

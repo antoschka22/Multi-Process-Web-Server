@@ -27,6 +27,5 @@ void serve_file(int client_socket, const char *path);
  * @param max_resp_len Maximum capacity of the output buffer.
  * @return int Total bytes written to response_buf, or -1 on error.
  */
-int handle_http_request(const char *request_buf, size_t req_len, char *response_buf, size_t max_resp_len);
-
+int handle_http_request(const char *request_buf, size_t req_len, char *response_buf, size_t max_resp_len, server_metrics_t *stats);
 #endif

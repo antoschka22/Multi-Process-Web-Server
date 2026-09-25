@@ -22,100 +22,91 @@
 /**
  * @brief Parses an HTTP GET request and writes a full HTTP response into response_buf.
  */
-int handle_http_request(const char *request_buf, size_t req_len, char *response_buf, size_t max_resp_len) {
-    (void)req_len; // Unused for simple null-terminated/text parsing
+int handle_http_request(const char *request_buf, size_t req_len, char *response_buf, size_t max_resp_len, server_metrics_t *stats) {
+    (void)req_len;
 
     char method[16] = {0};
     char uri[256] = {0};
     char version[16] = {0};
 
-    // 1. Basic HTTP request-line extraction
     if (sscanf(request_buf, "%15s %255s %15s", method, uri, version) < 2) {
-        // Malformed Request -> 400 Bad Request
+        if (stats) atomic_fetch_add_explicit(&stats->total_requests, 1, memory_order_relaxed);
         return snprintf(response_buf, max_resp_len,
-            "HTTP/1.1 400 Bad Request\r\n"
-            "Content-Type: text/plain\r\n"
-            "Content-Length: 15\r\n"
-            "Connection: close\r\n\r\n"
-            "400 Bad Request");
+            "HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 15\r\n\r\n400 Bad Request");
     }
+
+    if (stats) atomic_fetch_add_explicit(&stats->total_requests, 1, memory_order_relaxed);
 
     if (strcmp(method, "GET") != 0) {
-        // Method not allowed -> 405 Method Not Allowed
         return snprintf(response_buf, max_resp_len,
-            "HTTP/1.1 405 Method Not Allowed\r\n"
-            "Content-Type: text/plain\r\n"
-            "Content-Length: 22\r\n"
-            "Connection: close\r\n\r\n"
-            "405 Method Not Allowed");
+            "HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\nContent-Length: 22\r\n\r\n405 Method Not Allowed");
     }
 
-    // 2. Map route to local file
+    // Dynamic telemetry dashboard endpoint
+    if (strcmp(uri, "/status") == 0) {
+        uint64_t reqs = stats ? atomic_load_explicit(&stats->total_requests, memory_order_relaxed) : 0;
+        uint64_t s200 = stats ? atomic_load_explicit(&stats->success_200, memory_order_relaxed) : 0;
+        uint64_t e404 = stats ? atomic_load_explicit(&stats->error_404, memory_order_relaxed) : 0;
+        uint64_t bytes = stats ? atomic_load_explicit(&stats->total_bytes_sent, memory_order_relaxed) : 0;
+
+        char body[512];
+        int body_len = snprintf(body, sizeof(body),
+            "{\"total_requests\": %lu, \"success_200\": %lu, \"error_404\": %lu, \"bytes_sent\": %lu}",
+            reqs, s200, e404, bytes);
+
+        int total_len = snprintf(response_buf, max_resp_len,
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            "Connection: close\r\n"
+            "Content-Length: %d\r\n\r\n"
+            "%s", body_len, body);
+
+        if (stats) {
+            atomic_fetch_add_explicit(&stats->success_200, 1, memory_order_relaxed);
+            atomic_fetch_add_explicit(&stats->total_bytes_sent, total_len, memory_order_relaxed);
+        }
+        return total_len;
+    }
+
+    // Map route to local file
     char filepath[512] = {0};
     if (strcmp(uri, "/") == 0 || strcmp(uri, "/index.html") == 0) {
         snprintf(filepath, sizeof(filepath), "index.html");
     } else {
-        // Prevent directory traversal attacks (security check)
         if (strstr(uri, "..")) {
             return snprintf(response_buf, max_resp_len,
-                "HTTP/1.1 403 Forbidden\r\n"
-                "Content-Type: text/plain\r\n"
-                "Content-Length: 13\r\n"
-                "Connection: close\r\n\r\n"
-                "403 Forbidden");
+                "HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 13\r\n\r\n403 Forbidden");
         }
         snprintf(filepath, sizeof(filepath), "public%s", uri);
     }
 
-    // 3. Attempt to open and read the file
     int file_fd = open(filepath, O_RDONLY);
     if (file_fd < 0) {
-        // 404 Not Found fallback
-        const char *not_found_body = "<h1>404 Not Found</h1>";
+        if (stats) atomic_fetch_add_explicit(&stats->error_404, 1, memory_order_relaxed);
+        const char *not_found = "<h1>404 Not Found</h1>";
         return snprintf(response_buf, max_resp_len,
-            "HTTP/1.1 404 Not Found\r\n"
-            "Content-Type: text/html\r\n"
-            "Content-Length: %zu\r\n"
-            "Connection: close\r\n\r\n"
-            "%s", strlen(not_found_body), not_found_body);
+            "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\nConnection: close\r\nContent-Length: %zu\r\n\r\n%s",
+            strlen(not_found), not_found);
     }
 
-    // 4. Reserve header space and read file directly into response buffer body
-    char header_temp[256];
-    int body_offset = snprintf(header_temp, sizeof(header_temp),
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Type: text/html\r\n"
-        "Connection: close\r\n"
-        "Content-Length: ");
-
-    // Read payload from disk
     char file_content[2048];
     ssize_t bytes_read = read(file_fd, file_content, sizeof(file_content));
     close(file_fd);
 
-    if (bytes_read < 0) {
-        return snprintf(response_buf, max_resp_len,
-            "HTTP/1.1 500 Internal Server Error\r\n"
-            "Content-Type: text/plain\r\n"
-            "Content-Length: 25\r\n"
-            "Connection: close\r\n\r\n"
-            "500 Internal Server Error");
-    }
-
-    // 5. Assemble final response
+    const char *mime = get_mime_type(filepath);
     int total_len = snprintf(response_buf, max_resp_len,
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Type: text/html\r\n"
-        "Content-Length: %zd\r\n"
-        "Connection: close\r\n\r\n"
-        "%.*s",
-        bytes_read, (int)bytes_read, file_content);
+        "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nConnection: close\r\nContent-Length: %zd\r\n\r\n%.*s",
+        mime, bytes_read, (int)bytes_read, file_content);
+
+    if (stats) {
+        atomic_fetch_add_explicit(&stats->success_200, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&stats->total_bytes_sent, total_len, memory_order_relaxed);
+    }
 
     return total_len;
 }
-/**
- * Determina el tipo MIME en función de la extensión del archivo.
- */
+
+
 static const char *get_mime_type(const char *path) {
     const char *ext = strrchr(path, '.');
     if (!ext) return "application/octet-stream";
@@ -235,9 +226,7 @@ void serve_status_page(int client_socket, server_metrics_t *stats) {
     send(client_socket, response, resp_len, 0);
 }
 
-/**
- * Función requerida por http_handler.h: sirve un archivo o responde 404.
- */
+
 void serve_file(int client_socket, const char *path) {
     const char *mime = get_mime_type(path);
     if (serve_file_zero_copy(client_socket, path, mime) < 0) {
@@ -245,9 +234,7 @@ void serve_file(int client_socket, const char *path) {
     }
 }
 
-/**
- * Punto de entrada para el proceso hijo al recibir una conexión.
- */
+
 void handle_client(int client_socket, server_metrics_t *stats, sem_t *sem) {
     char buffer[2048];
     ssize_t bytes_read = recv(client_socket, buffer, sizeof(buffer) - 1, 0);

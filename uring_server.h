@@ -3,6 +3,7 @@
 
 #include <liburing.h>
 #include <stddef.h>
+#include "server_stats.h"
 
 #define QUEUE_DEPTH 512
 #define BUFFER_SIZE 4096
