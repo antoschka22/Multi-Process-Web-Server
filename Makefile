@@ -1,34 +1,30 @@
-# --- Project Configuration ---
-# The name of the final executable
 TARGET = webserver
 
-# Compiler and Flags
-CC = gcc
-# -Wall -Wextra: Show all warnings to ensure rigorous C basics
-# -g: Include debug symbols for troubleshooting signals/forking
-# -D_GNU_SOURCE: Enables certain modern features for shared memory/signals
-CFLAGS = -Wall -Wextra -g -O2 -D_GNU_SOURCE
+# Default compiler
+CC ?= gcc
+
+# Base warning, optimization, and debugging flags
+# -fno-omit-frame-pointer ensures accurate stack traces for perf/Flame Graphs
+CFLAGS = -Wall -Wextra -O2 -g -fno-omit-frame-pointer
+
+# Platform detection
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Linux)
+    # io_uring requires -luring; POSIX shm/sem require -lrt and -pthread
+    LIBS = -luring -lrt -pthread
+else ifeq ($(UNAME_S),Darwin)
+    $(error io_uring is a Linux-only subsystem. Please build and run inside Docker/Linux VM)
+endif
 
 # --- File Structure ---
-# List all .c files here. Based on your project needs:
-# main: Master process loop and socket setup [cite: 32]
-# http: Request parsing, file serving, and /status logic [cite: 38, 52]
-# ipc: Shared memory and semaphore management 
-# signals: SIGCHLD and SIGINT handling [cite: 56, 57]
 SRCS = main.c http_handler.c ipc_manager.c signal_handlers.c
-
-# Automatically generate a list of .o (object) files
 OBJS = $(SRCS:.c=.o)
-
-# Header files are listed so the project recompiles if a header changes
-HEADERS = server_stats.h http_handler.h ipc_manager.h signal_handlers.h
+HEADERS = uring_server.h server_stats.h http_handler.h ipc_manager.h signal_handlers.h
 
 # --- Build Rules ---
-
-# Default target: build the webserver
 all: $(TARGET)
 
-# Linking the final executable
+# Linking the final executable (ensure $(LIBS) comes AFTER $(OBJS))
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $(TARGET) $(OBJS) $(LIBS)
 	@echo "Build successful: ./$(TARGET)"
@@ -38,18 +34,13 @@ $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # --- Utility Targets ---
-
-# 'clean' removes compiled binaries and object files
 clean:
-	rm -f $(TARGET) $(OBJS)
-	@echo "Cleaned build artifacts."
+	rm -f $(TARGET) $(OBJS) *.svg *.txt
+	@echo "Cleaned build artifacts and profiling logs."
 
-# 'distclean' also cleans up any persistent OS resources if the program crashed
-# This is helpful because semaphores/shared memory can persist in /dev/shm [cite: 58]
 distclean: clean
-	@echo "Note: Ensure you manually check /dev/shm for leaked segments if server crashed."
+	@echo "Note: Check /dev/shm for leaked shared memory segments."
 
-# Rule to run the server (example on port 8080)
 run: $(TARGET)
 	./$(TARGET) 8080
 
