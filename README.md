@@ -1,76 +1,212 @@
-# Metric-Aware Multi-Process Web Server
+# Metric-Aware High-Performance C Web Server
 
-## Overview
-The "Metric-Aware" Multi-Process Web Server is a comprehensive system programming project that combines network communication, concurrent process management, and safe inter-process data sharing into a single application. At its core, it is a functional HTTP web server built entirely from scratch using standard C library socket APIs, bypassing high-level web frameworks. 
+A low-level HTTP server written from scratch in C, showcasing POSIX systems programming, inter-process communication (IPC), asynchronous I/O with `io_uring`, and reproducible container deployment.
 
-The server is designed to handle concurrent client connections by utilizing the `fork()` system call. While the parent process continuously listens for new connections, independent child processes take full responsibility for parsing HTTP GET requests and serving local files (or returning 404 errors). 
+Built as a systems-engineering portfolio project, it combines a classic Unix **pre-fork worker pool** with a modern Linux **`io_uring`** event loop in every worker, and exposes live request metrics from POSIX shared memory.
 
-A standout feature of this project is its live statistics tracking. All isolated child processes securely update global counters (such as total requests, 200 OKs, and 404 errors) in a shared memory segment. This data is safely synchronized using POSIX semaphores and can be viewed dynamically by accessing the `/status` endpoint.
+---
 
-## Motivation
-I developed this project to solidify and refine the practical skills I acquired during my **Operating Systems course at TU Wien**. It serves as a hands-on application of low-level system concepts, specifically focusing on:
-* **Inter-Process Communication (IPC):** Designing safe data exchange mechanisms between isolated processes.
-* **Shared Memory & Synchronization:** Using `mmap`/`shm_open` and POSIX semaphores to prevent race conditions during concurrent data access.
-* **Process Management:** Utilizing `fork()` for concurrency and `waitpid` to prevent resource-draining "zombie" processes.
-* **Signal Handling:** Implementing asynchronous signal handlers for graceful shutdowns (e.g., intercepting `SIGINT` via Ctrl+C) to safely unlink and destroy IPC resources without memory leaks.
-* **Networking & Sockets:** Managing TCP connections, binding ports, and raw HTTP request/response parsing.
-* **Error Handling & Argument Parsing:** Writing robust C code that anticipates and safely manages system call failures and user inputs.
+## Architecture
 
-## Features
-* **Concurrent Request Handling:** Spawns a dedicated child process for every incoming client connection.
-* **Static File Serving:** Reads and transmits local files, returning standard `HTTP 200 OK` or `HTTP 404 Not Found` responses.
-* **Live Dashboard (`/status`):** Bypasses the file system to serve a dynamically generated HTML/JSON dashboard reflecting real-time server traffic and health.
-* **Thread-Safe Metrics:** Employs POSIX semaphores as locks so multiple child processes can safely increment shared counters simultaneously.
-* **Clean Resource Management:** Catches `SIGCHLD` to reap finished child processes and intercepts keyboard interrupts to destroy shared memory blocks and semaphores before exiting.
+```mermaid
+flowchart TD
+    Client["Client (HTTP)"]
+    Sock["Shared listening socket<br/>TCP :8080"]
+    Client --> Sock
 
-## Technologies Used
-* **Language:** C
-* **APIs:** POSIX (Sockets, Shared Memory, Semaphores, Signals)
-* **Build System:** Make / GCC
+    Master["Master process<br/>forks the pool, supervises and respawns workers,<br/>handles SIGINT / SIGTERM shutdown"]
+
+    subgraph Pool["Pre-fork worker pool (NUM_WORKERS = 4)"]
+        W0["Worker 0<br/>io_uring loop"]
+        W1["Worker 1<br/>io_uring loop"]
+        W2["Worker 2<br/>io_uring loop"]
+        W3["Worker 3<br/>io_uring loop"]
+    end
+
+    Master -->|"fork()"| Pool
+    Sock -->|"accept() in every worker"| W0
+    Sock --> W1
+    Sock --> W2
+    Sock --> W3
+
+    SHM[("POSIX shared memory<br/>/dev/shm/webserver_stats<br/>requests, 200s, 404s, bytes")]
+    W0 -->|"atomic increments"| SHM
+    W1 --> SHM
+    W2 --> SHM
+    W3 --> SHM
+```
+
+### 1. Concurrency model
+
+- **Pre-fork worker pool (`fork`)**: the master creates one listening socket, then forks 4 workers (`NUM_WORKERS` in `main.c`). All workers `accept()` on the same inherited socket, and the kernel distributes connections between them.
+- **`io_uring` event loop per worker**: each worker runs its own ring and drives `accept -> recv -> handle -> send -> close` through submission/completion queues instead of blocking system calls.
+- **SQPOLL with fallback**: workers first request kernel submission polling (`IORING_SETUP_SQPOLL`), which lets the kernel pick up submissions without a syscall per request. If the kernel or privileges don't allow it, they fall back to a standard ring automatically.
+- **Supervision**: the master polls children with non-blocking `waitpid(WNOHANG)` once per second and respawns any worker that exits.
+
+Each worker handles a connection as a chain of `io_uring` completions:
+
+```mermaid
+flowchart LR
+    A["accept"] --> B["recv"]
+    B --> C["handle_http_request<br/>parse and build response"]
+    C --> D["send"]
+    D --> E["close"]
+    A -. "re-arm accept for the next client" .-> A
+```
+
+### 2. Inter-process communication and metrics
+
+- **Shared memory** (`ipc_manager.c/.h`): `shm_open` + `ftruncate` + `mmap(MAP_SHARED)` create `/dev/shm/webserver_stats`, which every forked worker inherits.
+- **Lock-free counters** (`server_stats.h`): the metrics struct uses C11 atomics (`atomic_uint_least64_t`, updated with `atomic_fetch_add_explicit`), so workers can update counters concurrently without taking a lock.
+- **Named POSIX semaphore** (`/webserver_sem`): `ipc_manager` also provides a binary named semaphore (`sem_open`, initial value 1) and unlinks it on shutdown. The `io_uring` workers rely on atomics instead of the semaphore.
+
+### 3. HTTP engine
+
+- **Request handling** (`http_handler.c/.h`): `handle_http_request()` parses the request line (`GET /path HTTP/1.1`) from an in-memory buffer and builds the full response into another buffer, which suits the async `io_uring` flow.
+- **Routes**:
+  - `GET /status` returns a JSON snapshot of the shared-memory counters (no filesystem access).
+  - `GET /` and `GET /index.html` serve the root `index.html`.
+  - Any other path is served from `public/`; missing files return `404`, paths containing `..` return `403`.
+  - Malformed requests return `400`, non-GET methods return `405`.
+- **MIME types**: chosen from the file extension (`html`, `css`, `js`, `png`, `jpg`, `gif`, ...).
+- **Connections** are closed after each response (`Connection: close`).
+
+### 4. Signals and shutdown
+
+- `SIGINT` / `SIGTERM` in the master set a flag; the master then sends `SIGTERM` to every worker, waits for them, and calls `cleanup_ipc()` to `shm_unlink` the shared memory and `sem_unlink` the semaphore before closing the listening socket.
+- Workers handle `SIGTERM` / `SIGINT` by leaving their `io_uring` loop, releasing the ring, and exiting. `SIGPIPE` is ignored so a client disconnecting mid-write can't kill a worker.
+
+### 5. Packaging
+
+- **Multi-stage Docker build**: the first stage compiles with `build-essential` and `liburing-dev`; the final image contains only the binary, the static files, and the `liburing2` runtime library.
+
+---
+
+## Repository Structure
+
+```text
+├── Dockerfile              # Multi-stage container build (compile, then slim runtime)
+├── Makefile                # GCC build, clean, distclean and run targets
+├── main.c                  # Master process, worker pool, io_uring event loop
+├── http_handler.c/.h       # HTTP request parsing, response building, routing
+├── ipc_manager.c/.h        # Shared memory mapping and named semaphore helpers
+├── signal_handlers.c/.h    # SIGCHLD / SIGINT handler helpers
+├── server_stats.h          # Shared metrics struct and IPC object names
+├── uring_server.h          # io_uring constants and per-connection context struct
+├── public/                 # Static asset root
+│   └── 404.html            # Not-found page
+├── index.html              # Default landing page
+└── .gitignore
+```
+
+---
+
+## Skills Demonstrated
+
+- **Systems programming (C):** POSIX APIs, pointers, manual memory management, `errno`-based error handling, modular header/implementation design.
+- **Linux internals:** process lifecycle (`fork`, `waitpid`), signal handling (`sigaction`), `io_uring` submission/completion queues, virtual memory mapping (`mmap`).
+- **Concurrency and synchronization:** pre-fork process pools, shared memory, C11 atomics and memory ordering, POSIX semaphores.
+- **Network engineering:** TCP sockets (`socket`, `bind`, `listen`, `accept`), asynchronous I/O, HTTP/1.1 request handling.
+- **DevOps and tooling:** Makefile builds, inspecting IPC objects in `/dev/shm`, multi-stage Docker builds.
+
+---
 
 ## Building and Running
 
-1. **Compile the project:**
-   ```bash
-   make
-   ```
-2. **Run the server** (defaults to port 8080, or specify a port as an argument)
-    ```bash
-    ./webserver 8080
-    ```
-3. **Clean build artifacts**
-    ```bash
-    make clean
-    ```
-4. **Deep clean** (helpful if the server crashes and leaces persistent OS resources in `/dev/shm`):
-    ```bash
-    make distclean
-    ```
+### Option 1: Native Linux host
 
-## Testing the Server
-Once the server is running on port 8080, you can test its functionality using your web browser or via command-line tools like `curl``.
-1. **Serving a valid HTML file**
-Ensure you have an `index.html` file in your project directory.
-* **Browser:** Navigate to `http://localhost:8080/index.html`
-* **cURL**: 
-    ```bash
-    curl -i http://localhost:8080/index.html
-    ```
-*(This should return an HTTP 200 OK along with the file contents).*
-2. **Triggering a 404 Not Found error:**
-Request a file that doesnt exist on the server to test the error handling.
-* **Browser:** Navigate to `http://localhost:8080/doesnotexist.html``
-* **cURL:**
-    ```bash
-    curl -i http://localhost:8080/doesnotexist.html
-    ```
-*(This should return an HTTP 404 Not Found response).*
+**Requirements:** Linux (kernel 5.1+ for `io_uring`), GCC, GNU Make, and liburing.
 
-3. **Viewing the Live IPC Status Dashboard:**
-To test the shared memory and semaphore functionality, check the live server metrics.
-* **Browser:** Navigate to `http://localhost:8080/status`
-* **cURL:**
-    ```bash
-    curl -i http://localhost:8080/status
-    ```
-*(This dynamically generates an HTML response showing the current number of Total Requests, 200 OKs, and 404 Errors). Tip: Try requesting a mix of valid files, invalid files, and the status page multiple times to watch the shared memory counters increment perfectly without race conditions!*
+```bash
+sudo apt install build-essential liburing-dev   # Debian/Ubuntu
+```
+
+Compile:
+
+```bash
+make
+```
+
+Start the server (defaults to port 8080, or pass a port):
+
+```bash
+./webserver 8080
+```
+
+Other targets:
+
+```bash
+make run        # build and start on port 8080
+make clean      # remove the binary and object files
+make distclean  # clean, then remind you to check /dev/shm for leftovers
+```
+
+If the server was killed with `SIGKILL` or crashed, remove leftover IPC objects manually:
+
+```bash
+rm -f /dev/shm/webserver_stats /dev/shm/sem.webserver_sem
+```
+
+> macOS is not supported natively because `io_uring` is Linux-only. Use Docker or a Linux VM.
+
+### Option 2: Docker
+
+Build the image:
+
+```bash
+docker build -t multi-process-web-server .
+```
+
+Run the container:
+
+```bash
+docker run -d -p 8080:8080 --security-opt seccomp=unconfined --name web-server multi-process-web-server
+```
+
+`--security-opt seccomp=unconfined` is required because Docker's default seccomp profile blocks the `io_uring` system calls. Without it the workers cannot create their rings and will exit immediately.
+
+View the logs:
+
+```bash
+docker logs web-server
+```
+
+---
+
+## Verification and Testing
+
+Serve a valid static file (`200 OK`):
+
+```bash
+curl -i http://localhost:8080/index.html
+```
+
+Trigger a `404 Not Found`:
+
+```bash
+curl -i http://localhost:8080/missing-file.html
+```
+
+Inspect live telemetry (JSON from shared memory):
+
+```bash
+curl -i http://localhost:8080/status
+```
+
+Fire 100 concurrent requests, then check the counters:
+
+```bash
+# Launch 100 background curl processes and wait for them all
+for i in {1..100}; do curl -s http://localhost:8080/index.html > /dev/null & done; wait
+curl -s http://localhost:8080/status
+```
+
+The `total_requests` and `success_200` counters should account for every request, which shows that updates from separate worker processes aren't being lost.
+
+---
+
+## Limitations
+
+- Responses are limited to roughly 4 KB and static files are read in a single 2 KB chunk, so larger files are truncated. This is a demonstration server, not a general-purpose file server.
+- No keep-alive, TLS, or request-body handling; every connection serves one `GET` and closes.
+- Linux only.
