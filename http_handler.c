@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 #define _GNU_SOURCE  /* Exposes Linux/glibc-specific extensions, including sendfile() and TCP_CORK */
 
 #include <stdio.h>       /* Standard I/O operations (snprintf, perror) */
@@ -12,23 +11,6 @@
 #include <sys/sendfile.h>/* Linux-specific zero-copy data transfer interface (sendfile) */
 #include <netinet/tcp.h> /* TCP-level socket options (TCP_CORK) */
 #include <errno.h>       /* System error number definitions (EAGAIN, EINTR) */
-=======
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE
-#endif
-
-#include "http_handler.h"
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <netinet/tcp.h>
-#include <errno.h>
->>>>>>> 780a5fb52b7f8cccf48514d57f6da574e5a90355
 
 #if defined(__linux__)
 #include <sys/sendfile.h>
@@ -36,7 +18,6 @@
 
 
 /**
-<<<<<<< HEAD
  * @brief Serves a static file to an active client socket using zero-copy I/O
  *
  * This function bypasses userspace data transfers entirely:
@@ -58,126 +39,16 @@ int serve_file_zero_copy(int client_socket, const char *file_path, const char *c
      * Open the requested static asset in read-only mode
      * We need a valid file descriptor to probe file metadata and back sendfile()
      */
-=======
- * @brief Parses an HTTP GET request and writes a full HTTP response into response_buf.
- */
-int handle_http_request(const char *request_buf, size_t req_len, char *response_buf, size_t max_resp_len, server_metrics_t *stats) {
-    (void)req_len;
-
-    char method[16] = {0};
-    char uri[256] = {0};
-    char version[16] = {0};
-
-    if (sscanf(request_buf, "%15s %255s %15s", method, uri, version) < 2) {
-        if (stats) atomic_fetch_add_explicit(&stats->total_requests, 1, memory_order_relaxed);
-        return snprintf(response_buf, max_resp_len,
-            "HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 15\r\n\r\n400 Bad Request");
-    }
-
-    if (stats) atomic_fetch_add_explicit(&stats->total_requests, 1, memory_order_relaxed);
-
-    if (strcmp(method, "GET") != 0) {
-        return snprintf(response_buf, max_resp_len,
-            "HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\nContent-Length: 22\r\n\r\n405 Method Not Allowed");
-    }
-
-    // Dynamic telemetry dashboard endpoint
-    if (strcmp(uri, "/status") == 0) {
-        uint64_t reqs = stats ? atomic_load_explicit(&stats->total_requests, memory_order_relaxed) : 0;
-        uint64_t s200 = stats ? atomic_load_explicit(&stats->success_200, memory_order_relaxed) : 0;
-        uint64_t e404 = stats ? atomic_load_explicit(&stats->error_404, memory_order_relaxed) : 0;
-        uint64_t bytes = stats ? atomic_load_explicit(&stats->total_bytes_sent, memory_order_relaxed) : 0;
-
-        char body[512];
-        int body_len = snprintf(body, sizeof(body),
-            "{\"total_requests\": %lu, \"success_200\": %lu, \"error_404\": %lu, \"bytes_sent\": %lu}",
-            reqs, s200, e404, bytes);
-
-        int total_len = snprintf(response_buf, max_resp_len,
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: application/json\r\n"
-            "Connection: close\r\n"
-            "Content-Length: %d\r\n\r\n"
-            "%s", body_len, body);
-
-        if (stats) {
-            atomic_fetch_add_explicit(&stats->success_200, 1, memory_order_relaxed);
-            atomic_fetch_add_explicit(&stats->total_bytes_sent, total_len, memory_order_relaxed);
-        }
-        return total_len;
-    }
-
-    // Map route to local file
-    char filepath[512] = {0};
-    if (strcmp(uri, "/") == 0 || strcmp(uri, "/index.html") == 0) {
-        snprintf(filepath, sizeof(filepath), "index.html");
-    } else {
-        if (strstr(uri, "..")) {
-            return snprintf(response_buf, max_resp_len,
-                "HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 13\r\n\r\n403 Forbidden");
-        }
-        snprintf(filepath, sizeof(filepath), "public%s", uri);
-    }
-
-    int file_fd = open(filepath, O_RDONLY);
-    if (file_fd < 0) {
-        if (stats) atomic_fetch_add_explicit(&stats->error_404, 1, memory_order_relaxed);
-        const char *not_found = "<h1>404 Not Found</h1>";
-        return snprintf(response_buf, max_resp_len,
-            "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\nConnection: close\r\nContent-Length: %zu\r\n\r\n%s",
-            strlen(not_found), not_found);
-    }
-
-    char file_content[2048];
-    ssize_t bytes_read = read(file_fd, file_content, sizeof(file_content));
-    close(file_fd);
-
-    const char *mime = get_mime_type(filepath);
-    int total_len = snprintf(response_buf, max_resp_len,
-        "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nConnection: close\r\nContent-Length: %zd\r\n\r\n%.*s",
-        mime, bytes_read, (int)bytes_read, file_content);
-
-    if (stats) {
-        atomic_fetch_add_explicit(&stats->success_200, 1, memory_order_relaxed);
-        atomic_fetch_add_explicit(&stats->total_bytes_sent, total_len, memory_order_relaxed);
-    }
-
-    return total_len;
-}
-
-
-static const char *get_mime_type(const char *path) {
-    const char *ext = strrchr(path, '.');
-    if (!ext) return "application/octet-stream";
-    if (strcmp(ext, ".html") == 0 || strcmp(ext, ".htm") == 0) return "text/html";
-    if (strcmp(ext, ".css") == 0) return "text/css";
-    if (strcmp(ext, ".js") == 0) return "application/javascript";
-    if (strcmp(ext, ".png") == 0) return "image/png";
-    if (strcmp(ext, ".jpg") == 0 || strcmp(ext, ".jpeg") == 0) return "image/jpeg";
-    if (strcmp(ext, ".gif") == 0) return "image/gif";
-    if (strcmp(ext, ".dat") == 0) return "application/octet-stream";
-    return "text/plain";
-}
-
-/**
- * Envía un archivo al socket cliente usando sendfile (Zero-Copy).
- * Compatible con macOS (Darwin) y Linux.
- */
-int serve_file_zero_copy(int client_socket, const char *file_path, const char *content_type) {
->>>>>>> 780a5fb52b7f8cccf48514d57f6da574e5a90355
     int file_fd = open(file_path, O_RDONLY);
     if (file_fd < 0) {
         return -1;
     }
 
-<<<<<<< HEAD
     /*
      * Retrieve file status metadata
      * st_size is required to inform the client of exact payload dimensions
      * via the HTTP Content-Length header, and to drive our transfer loop bound
      */
-=======
->>>>>>> 780a5fb52b7f8cccf48514d57f6da574e5a90355
     struct stat st;
     if (fstat(file_fd, &st) < 0) {
         close(file_fd);
@@ -186,14 +57,11 @@ int serve_file_zero_copy(int client_socket, const char *file_path, const char *c
 
     off_t total_bytes = st.st_size;
 
-<<<<<<< HEAD
     /*
      * Construct standard HTTP/1.1 response headers
      * 512 bytes is adequate for this fixed header payload; snprintf ensures
      * buffer overflow protection
      */
-=======
->>>>>>> 780a5fb52b7f8cccf48514d57f6da574e5a90355
     char header_buffer[512];
     int header_len = snprintf(header_buffer, sizeof(header_buffer),
         "HTTP/1.1 200 OK\r\n"
@@ -213,7 +81,6 @@ int serve_file_zero_copy(int client_socket, const char *file_path, const char *c
         return -1;
     }
 
-<<<<<<< HEAD
     /*
      * Enable TCP_CORK (Linux-specific optimization)
      *
@@ -268,30 +135,6 @@ int serve_file_zero_copy(int client_socket, const char *file_path, const char *c
      */
     cork = 0;
     setsockopt(client_socket, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
-=======
-#if defined(__APPLE__)
-    // En macOS: sendfile(fd_archivo, fd_socket, offset_inicial, &longitud, cabeceras, flags)
-    off_t len = total_bytes;
-    if (sendfile(file_fd, client_socket, 0, &len, NULL, 0) < 0) {
-        if (errno != EAGAIN && errno != EINTR) {
-            close(file_fd);
-            return -1;
-        }
-    }
-#elif defined(__linux__)
-    // En Linux: sendfile(fd_socket, fd_archivo, &offset, conteo_bytes)
-    off_t offset = 0;
-    while (offset < total_bytes) {
-        ssize_t bytes_sent = sendfile(client_socket, file_fd, &offset, total_bytes - offset);
-        if (bytes_sent < 0) {
-            if (errno == EAGAIN || errno == EINTR) continue;
-            close(file_fd);
-            return -1;
-        }
-        if (bytes_sent == 0) break;
-    }
-#endif
->>>>>>> 780a5fb52b7f8cccf48514d57f6da574e5a90355
 
     /* Release file descriptor resources; client socket management remains with caller */
     close(file_fd);
